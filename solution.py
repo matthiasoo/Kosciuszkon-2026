@@ -146,16 +146,53 @@ def assign_block_folds(df):
 
 
 # =============================================================================
-# 4. LISTA CECH
+# 4. LISTA CECH I ICH WYTŁUMACZENIE (Feature Selection & Rationale)
 # =============================================================================
 
 LABEL_COL = 'label'
 META_COLS = [LABEL_COL, 'segment', 'block_fold']
 
-def get_feature_cols(df):
-    """Zwraca nazwy kolumn cech (wszystko co nie jest metadana/label)."""
-    return [c for c in df.columns if c not in META_COLS]
+# ZGODNIE Z WYMAGANIAMI: Każda wybrana cecha ma wytłumaczenie, czemu została
+# wybrana do predykcji. Selekcja ta pozwala uniknąć Data Leakage (wycieku danych),
+# ponieważ model nie widzi bezwzględnych współrzędnych geograficznych ani prędkości,
+# które mogłyby identyfikować konkretny lot.
+SELECTED_FEATURES = {
+    # --- CECHY INNOWACJI (ROZJAZD SENSORÓW: EKF vs GPS) ---
+    # Podstawa detekcji: w trakcie ataku spoofingowego, odczyty z zakłócanego GPS
+    # przestają zgadzać się z modelem fizycznym i pomiarami inercyjnymi drona (IMU).
+    'pos_diff_h_m': "Rozjazd pozycji w poziomie (horyzontalny) między EKF a GPS. Kluczowy wskaźnik ściągania drona z trasy.",
+    'pos_diff_3d_m': "Całkowity (3D) rozjazd pozycji w metrach. Spoofing często zaburza również estymację wysokości (Z).",
+    'vel_diff_h': "Rozjazd wektora prędkości w poziomie. Pozwala szybko wykryć atak zanim nastąpi duży dryf pozycji (anomalia pochodnej ruchu).",
+    'vel_diff_3d': "Całkowity rozjazd wektora prędkości w 3D. Wykrywa trójwymiarowe rozbieżności dynamiczne.",
+    'speed_diff': "Różnica w skalarnej prędkości drona. Prosta miara pokazująca, że odbiornik GPS podaje prędkość fizycznie niemożliwą do osiągnięcia w danym momencie.",
+    'abs_cog_diff': "Bezwzględna różnica kursu (Course Over Ground). Spoofer często wymusza wektor prędkości o kącie niezgodnym z faktycznym zwrotem (headingiem) i ruchem maszyny.",
+    
+    # --- CECHY JAKOŚCI SYGNAŁU GPS I GEOMETRII ---
+    # Atak spoofingowy sztucznie podmienia satelity, co nierzadko powoduje skoki w 
+    # estymowanej dokładności i geometriach satelitów raportowanych przez sam odbiornik.
+    'eph_y': "Estymowany błąd horyzontalny GPS (Expected Position Error). Wybrany, ponieważ często skacze lub drastycznie maleje w momencie przejmowania sygnału przez spoofera.",
+    'epv_y': "Estymowany błąd wertykalny GPS. Działa jak wyżej, sygnalizując nienormalne zaufanie lub brak zaufania do rozwiązania wysokościowego.",
+    'hdop': "Horizontal Dilution of Precision. Wybrano ją, bo spooferzy z jednym nadajnikiem psują geometrię poziomą (sygnały przychodzą z jednego kierunku), co zaburza HDOP.",
+    'vdop': "Vertical Dilution of Precision. Analogicznie jak HDOP, sztuczny układ satelitów degraduje dopasowanie pionowe.",
+    's_variance_m_s': "Wariancja prędkości z odbiornika GPS. Rosnąca wariancja demaskuje szum i niestabilność pętli śledzenia PLL/DLL podczas ataku.",
+    'c_variance_rad': "Wariancja kursu z odbiornika. Ujawnia utratę stabilnego lock-a na nośnej (carrier phase) z powodu sygnałów zagłuszających (jamming towarzyszący).",
+    
+    # --- CECHY DYNAMIKI LOTU (IMU) ---
+    # Jeśli dron dostanie zły GPS, uważa, że zdmuchnął go wiatr i próbuje to korygować, 
+    # co skutkuje gwałtownym pochyleniem i przyspieszeniem maszyn.
+    'ax': "Akceleracja osi X. Rejestruje nagłe szarpnięcia do przodu/tyłu gdy kontroler próbuje nadrobić 'utraconą' wg fałszywego GPS pozycję.",
+    'ay': "Akceleracja osi Y. Rejestruje szarpnięcia boczne na skutek prób powrotu na trajektorię odchyloną przez atak.",
+    'az': "Akceleracja osi Z. Ujawnia próby gwałtownej korekty wysokości wywołanej m.in. sztucznym meandrowaniem sygnału w osi D."
+}
 
+def get_feature_cols(df):
+    """
+    Zwraca nazwy ściśle wyselekcjonowanych kolumn cech (whitelist) używanych do predykcji ML.
+    Model otrzymuje wyłącznie te cechy, które mają mocne fizyczne i analityczne uzasadnienie.
+    """
+    selected = list(SELECTED_FEATURES.keys())
+    # Dodatkowe zabezpieczenie w wypadku braku którejś kolumny w df
+    return [col for col in selected if col in df.columns]
 
 # =============================================================================
 # 5. DETEKTOR KLASYCZNY — TEST INNOWACJI KALMANA (chi-squared)
