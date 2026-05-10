@@ -6,7 +6,6 @@ import matplotlib
 import warnings
 warnings.filterwarnings('ignore')
 
-# Automatyczne wykrywanie katalogu głównego projektu
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_DATA_PATH = os.path.join(BASE_DIR, 'data', 'honeywell_gold_dataset.csv')
 DEFAULT_VIS_DIR = os.path.join(BASE_DIR, 'visualization')
@@ -57,11 +56,8 @@ def setup_plot_style():
 
 setup_plot_style()
 
-# Wczytanie i czyszczenie danych
 def load_and_clean(path=DEFAULT_DATA_PATH):
-    """
-    Wczytuje dane i usuwa niepotrzebne kolumny.
-    """
+
     df = pd.read_csv(path)
 
     CONST_COLS = [

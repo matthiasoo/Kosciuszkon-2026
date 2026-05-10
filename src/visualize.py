@@ -3,7 +3,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 from math import pi
 
-# Automatyczne wykrywanie katalogu głównego projektu
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_VIS_DIR = os.path.join(BASE_DIR, 'visualization')
 
