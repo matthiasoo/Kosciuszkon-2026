@@ -1,6 +1,11 @@
+import os
 import numpy as np
 import matplotlib.pyplot as plt
 from math import pi
+
+# Automatyczne wykrywanie katalogu głównego projektu
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_VIS_DIR = os.path.join(BASE_DIR, 'visualization')
 
 PLOT_STYLE = {
     'bg_color': '#1a1a2e',
@@ -39,7 +44,9 @@ def setup_plot_style():
     })
 
 # Szeregi czasowe
-def plot_signal_drift(save_path='../visualization/plot_1_signal_drift.png'):
+def plot_signal_drift(save_path=None):
+    if save_path is None:
+        save_path = os.path.join(DEFAULT_VIS_DIR, 'plot_1_signal_drift.png')
     setup_plot_style()
     
     t = np.linspace(0, 100, 500)
@@ -75,7 +82,9 @@ def plot_signal_drift(save_path='../visualization/plot_1_signal_drift.png'):
     plt.close()
 
 # Opóźnienia
-def plot_latency_comparison(save_path='../visualization/plot_2_latency.png'):
+def plot_latency_comparison(save_path=None):
+    if save_path is None:
+        save_path = os.path.join(DEFAULT_VIS_DIR, 'plot_2_latency.png')
     setup_plot_style()
     
     models = ['Filtr Kalmana (χ²)', 'LightGBM', 'XGBoost']
@@ -105,7 +114,9 @@ def plot_latency_comparison(save_path='../visualization/plot_2_latency.png'):
     plt.close()
 
 # Porównanie modeli
-def plot_radar_comparison(save_path='../visualization/plot_3_radar.png'):
+def plot_radar_comparison(save_path=None):
+    if save_path is None:
+        save_path = os.path.join(DEFAULT_VIS_DIR, 'plot_3_radar.png')
     setup_plot_style()
     
     categories = ['Dokładność (F1 Score)', 'Szybkość Obliczeń', 'Brak Zapotrzebowania\nna Dane (No-Training)', 'Wyjaśnialność\n(Explainability)']

@@ -1,9 +1,15 @@
+import os
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib
 import warnings
 warnings.filterwarnings('ignore')
+
+# Automatyczne wykrywanie katalogu głównego projektu
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_DATA_PATH = os.path.join(BASE_DIR, 'data', 'honeywell_gold_dataset.csv')
+DEFAULT_VIS_DIR = os.path.join(BASE_DIR, 'visualization')
 
 from sklearn.metrics import (f1_score, roc_auc_score, accuracy_score,
                              precision_score, recall_score, confusion_matrix,
@@ -52,7 +58,7 @@ def setup_plot_style():
 setup_plot_style()
 
 # Wczytanie i czyszczenie danych
-def load_and_clean(path='../data/honeywell_gold_dataset.csv'):
+def load_and_clean(path=DEFAULT_DATA_PATH):
     """
     Wczytuje dane i usuwa niepotrzebne kolumny.
     """
@@ -184,10 +190,12 @@ def get_feature_cols(df):
 
 
 # Wizualizacja dystrybucji cech
-def plot_feature_distributions(df, save_path='../visualization/plots_distributions.png'):
+def plot_feature_distributions(df, save_path=None):
     """
     Generuje histogramy dystrybucji wybranych cech.
     """
+    if save_path is None:
+        save_path = os.path.join(DEFAULT_VIS_DIR, 'plots_distributions.png')
     features = get_feature_cols(df)
     n = len(features)
     ncols = 3
@@ -221,10 +229,12 @@ def plot_feature_distributions(df, save_path='../visualization/plots_distributio
 
 
 # Macierz pomyłek
-def plot_confusion_matrices(cm_dict, save_path='../visualization/plots_confusion_matrices.png'):
+def plot_confusion_matrices(cm_dict, save_path=None):
     """
     Rysuje macierze pomylek dla wszystkich modeli.
     """
+    if save_path is None:
+        save_path = os.path.join(DEFAULT_VIS_DIR, 'plots_confusion_matrices.png')
     models = list(cm_dict.keys())
     n_models = len(models)
 
