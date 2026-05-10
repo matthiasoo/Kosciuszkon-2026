@@ -13,8 +13,6 @@
 - wstrzyknąć syntetyczną trajektorię oderwaną od rzeczywistego ruchu,
 - współistnieć z jammingiem lub innymi zakłóceniami RF.
 
-Atak jest niebezpieczny, bo autopilot ufa GPS dla wyznaczania pozycji absolutnej. Jeśli EKF zaakceptuje sfałszowane pomiary, dron leci po fałszywej trajektorii *myśląc*, że jest na kursie.
-
 **Cel**: Przewidywanie kolumny `label` (binarna: 0 = czysty lot, 1 = spoofing GPS).
 
 ---
@@ -51,140 +49,143 @@ Dataset składa się z **6 ciągłych segmentów** (naprzemiennie clean / attack
 | 5 | 0 (clean) | 1 249 | 18 744..19 992 |
 | 6 | 1 (attack) | 4 999 | 19 993..24 991 |
 
-**UWAGA**: Dataset **nie zawiera kolumny identyfikującej typ scenariusza ataku** (np. "horizontal_drift", "altitude_spoof"). Nie da się więc zaimplementować Leave-One-Attack-Scenario-Out (LOSO). Nazwy scenariuszy, jeśli występują w literaturze, nie są odwzorowane w danych.
+**UWAGA**: Dataset **nie zawiera kolumny identyfikującej typ scenariusza ataku**. Nie da się zaimplementować Leave-One-Attack-Scenario-Out (LOSO).
 
 ### 2.2 Pułapki danych
 
-1. **35 z 84 kolumn jest stałych** — liczniki resetów EKF, flagi walidacji, punkt referencyjny. Nie niosą żadnego sygnału.
-2. `timestamp` to **indeks próbki**, nie czas rzeczywisty. `time_utc_usec` jest stały (zero). Użycie `timestamp` jako cechy powoduje data leakage (identyfikuje segment → label).
-3. **Niezgodność jednostek**: `lat_y`, `lon_y` są w stopniach × 1e7; `alt_y` w milimetrach. Trzeba przeskalować przed porównaniem z kolumnami EKF.
+1. **35 z 84 kolumn jest stałych** — nie niosą sygnału.
+2. `timestamp` to **indeks próbki**, nie czas. Użycie go jako cechy powoduje data leakage.
+3. **Niezgodność jednostek**: `lat_y`, `lon_y` w stopniach × 1e7; `alt_y` w milimetrach.
 4. **Jeden dron, jedno środowisko** — ogranicza transferowalność.
-5. **Kolumny zdrowia odbiornika** (`jamming_indicator`, `noise_per_ms`, `satellites_used`) nie separują spoofingu od czystego lotu.
+5. **Kolumny zdrowia odbiornika** (`jamming_indicator`, `noise_per_ms`, `satellites_used`) nie separują spoofingu.
 
 ---
 
 ## 3. Inżynieria cech
 
-Trzy warstwy przetwarzania:
-
 ### 3.1 Czyszczenie
 
-- Usunięcie 35 stałych kolumn
-- Usunięcie `timestamp` (zapobieganie leakage)
-- Usunięcie kolumn zdrowia odbiornika (brak sygnału)
+- Usunięcie 35 stałych kolumn + `timestamp` + kolumn zdrowia odbiornika
 - Normalizacja GPS: `lat_y /= 1e7`, `lon_y /= 1e7`, `alt_y /= 1000`
 
 ### 3.2 Cechy rozjazdu EKF vs GPS
 
-Główny sygnał detekcji: rozjazd między estymatą EKF (kolumny `*_x`) a surowym GPS (`*_y`). Pod hipotezą zerową (brak spoofingu) rozjazd powinien być bliski zeru.
+| cecha | definicja |
+|---|---|
+| `lat_diff_m`, `lon_diff_m`, `alt_diff_m` | rozjazd pozycyjny EKF vs GPS w metrach |
+| `pos_diff_h_m`, `pos_diff_3d_m` | norma pozioma / 3D rozjazdu |
+| `vn_diff`, `ve_diff`, `vd_diff` | reszty prędkości NED |
+| `vel_diff_h`, `vel_diff_3d` | normy prędkości |
+| `speed_diff` | różnica magnitudy prędkości |
+| `cog_diff`, `abs_cog_diff` | rozjazd kierunku ruchu |
 
-| cecha | definicja | dlaczego użyteczna |
-|---|---|---|
-| `lat_diff_m` | `(lat_x - lat_y) × 111 000` | rozjazd latitude w metrach |
-| `lon_diff_m` | `(lon_x - lon_y) × 111 000 × cos(lat)` | rozjazd longitude w metrach |
-| `alt_diff_m` | `alt_x - alt_y` | rozjazd wysokości w metrach |
-| `pos_diff_h_m` | norma pozioma | magnituda rozjazdu w płaszczyźnie |
-| `pos_diff_3d_m` | norma 3D | magnituda rozjazdu w przestrzeni |
-| `vn_diff`, `ve_diff`, `vd_diff` | reszty prędkości NED | niefizyczne zmiany prędkości GPS |
-| `vel_diff_h`, `vel_diff_3d` | normy prędkości | magnituda rozjazdu prędkości |
-| `speed_diff` | `‖(vx,vy,vz)‖ - vel_m_s` | spójność magnitudy prędkości |
-| `cog_diff` | różnica kątowa kursu | rozjazd kierunku ruchu |
-
-**Po obliczeniu cech rozjazdu, surowe kolumny pozycyjne (`lat_x`, `lon_x`, `alt_x`, `lat_y`, `lon_y`, `alt_y`, `x`, `y`, `z`) są usuwane** — ich bezpośrednie użycie w modelu powodowałoby leakage.
-
-### 3.3 Wynikowy zbiór cech
-
-Po przetworzeniu: **48 cech** (34 oczyszczone surowe + 14 rozjazdu).
+Po obliczeniu cech rozjazdu surowe kolumny pozycyjne są **usuwane**. Wynikowy zbiór: **48 cech**.
 
 ---
 
-## 4. Protokoły ewaluacji
+## 4. Porównane metody
 
-Stosujemy **dwa protokoły** ewaluacji, aby uczciwie raportować zarówno górny limit jak i realistyczną generalizację:
+| # | Metoda | Kategoria | Wymaga treningu? |
+|---|---|---|---|
+| 1 | **Test innowacji Kalmana (chi-squared)** | klasyczny statystyczny | NIE |
+| 2 | **XGBoost** | gradient boosting | TAK |
+| 3 | **LightGBM** | gradient boosting | TAK |
 
-### 4.1 Protokół A — Stratified 4-Fold CV (losowy podział)
+### 4.1 Test innowacji Kalmana
 
-Losowy podział stratyfikowany. Daje **zawyżone wyniki** (F1 ≈ 1.0) ponieważ sąsiednie próbki w tym samym segmencie są prawie identyczne — losowy podział rozrzuca je między train i test, co jest de facto data leakage z sąsiedztwa próbek. Raportujemy jako **górny limit**, nie realistyczny wynik.
+Klasyczna metoda oparta na fizyce EKF. Oblicza statystykę χ² porównującą estymaty EKF z surowym GPS, normalizowaną raportowaną niepewnością:
 
-### 4.2 Protokół B — Block-based 3-Fold CV (podział po segmentach)
+```
+χ² = (Δn² + Δe²) / eph² + Δd² / epv²
+```
+
+Pod H0 (brak spoofingu) χ² ~ χ²(3). Spoofing łamie zgodność EKF/GPS, więc χ² rośnie. Domyślny próg detekcji: 95% kwantyl χ²₃ = 7.815.
+
+### 4.2 Modele ML
+
+- **XGBoost**: `n_estimators=400, max_depth=6, learning_rate=0.05, subsample=0.85`
+- **LightGBM**: `n_estimators=600, learning_rate=0.04, num_leaves=63, min_child_samples=20`
+
+Oba trenowane na 48 cechach (po inżynierii) ze StandardScaler.
+
+---
+
+## 5. Protokół ewaluacji
+
+### Block-based 3-Fold CV
 
 Łączymy sąsiednie segmenty clean+attack w 3 foldy:
 - **Fold 0**: segmenty 1+2 (8 122 clean + 4 374 attack)
 - **Fold 1**: segmenty 3+4 (2 499 clean + 3 749 attack)
 - **Fold 2**: segmenty 5+6 (1 249 clean + 4 999 attack)
 
-To jest **realistyczny test generalizacji**: model trenuje na danych z dwóch sesji i jest testowany na trzeciej sesji, której nigdy nie widział. Nie ma leakage z sąsiedztwa próbek.
+**Realistyczny test generalizacji**: model trenuje na dwóch sesjach, testowany na trzeciej sesji.
 
----
-
-## 5. Model
-
-**XGBoost** (gradient boosted trees):
-
-```
-n_estimators=400, max_depth=6, learning_rate=0.05,
-subsample=0.85, colsample_bytree=0.85
-```
-
-Standardowe skalowanie cech (`StandardScaler`) przed treningiem.
+Kalibracja progu: wyznaczana z danych treningowych per fold (bez przecieku z testu).
 
 ---
 
 ## 6. Wyniki
 
-### 6.1 Protokół A — Stratified CV (górny limit, zawyżony)
+### 6.1 Porównanie modeli (Block CV)
 
-| fold | F1 | precision | recall | AUC |
-|---|---|---|---|---|
-| fold_0 | 1.000 | 1.000 | 1.000 | 1.000 |
-| fold_1 | 0.999 | 0.999 | 0.999 | 1.000 |
-| fold_2 | 1.000 | 1.000 | 0.999 | 1.000 |
-| fold_3 | 1.000 | 1.000 | 0.999 | 1.000 |
-| **Średnia** | **1.000** | **1.000** | **0.999** | **1.000** |
+| Metoda | F1 @domyślny | F1 @kalibrowany | Precision | Recall | AUC |
+|---|---|---|---|---|---|
+| **Kalman chi²** | **0.876** | **0.840** | **0.862** | **0.859** | **0.900** |
+| LightGBM | 0.557 | 0.557 | 0.515 | 0.626 | 0.801 |
+| XGBoost | 0.498 | 0.466 | 0.516 | 0.477 | 0.905 |
 
-**UWAGA**: Te wyniki są zawyżone (data leakage z sąsiedztwa próbek). Nie są miarodajne.
+### 6.2 Kalman chi² — wyniki per fold
 
-### 6.2 Protokół B — Block CV (realistyczny)
-
-| fold | test rows | pos_rate | F1 | precision | recall | AUC |
+| fold | test rows | F1 @7.81 | F1 @cal | precision | recall | AUC |
 |---|---|---|---|---|---|---|
-| block_0 | 12 496 | 0.35 | 0.669 | 0.549 | 0.857 | 0.914 |
-| block_1 | 6 248 | 0.60 | 0.000 | 0.000 | 0.000 | 0.800 |
-| block_2 | 6 248 | 0.80 | 0.825 | 1.000 | 0.704 | 1.000 |
-| **Średnia** | | | **0.498** | **0.516** | **0.521** | **0.905** |
+| block_0 | 12 496 | 0.883 | 0.709 | 0.587 | 0.893 | 0.942 |
+| block_1 | 6 248 | 0.746 | 0.813 | 1.000 | 0.684 | 0.757 |
+| block_2 | 6 248 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 |
 
-### 6.3 Interpretacja wyników
+### 6.3 XGBoost — wyniki per fold
 
-**Block fold 0** (F1 = 0.67): Model wykrywa atak z recall = 0.86 ale precision = 0.55, co daje dużo fałszywych alarmów. AUC = 0.91 sugeruje że ranking jest dobry.
+| fold | test rows | F1 @0.5 | precision | recall | AUC |
+|---|---|---|---|---|---|
+| block_0 | 12 496 | 0.669 | 0.549 | 0.857 | 0.914 |
+| block_1 | 6 248 | **0.000** | 0.000 | 0.000 | 0.800 |
+| block_2 | 6 248 | 0.825 | 1.000 | 0.704 | 1.000 |
 
-**Block fold 1** (F1 = 0.00): Kompletna porażka — model **nie potrafi** wykryć żadnego ataku w segmencie 4. AUC = 0.80 pokazuje że ranking jest ponadlosowy (model "widzi" sygnał w predykcjach), ale próg 0.5 nie trafia w rozkład tego foldu.
+### 6.4 LightGBM — wyniki per fold
 
-**Block fold 2** (F1 = 0.83): Dobra detekcja z precision = 1.00 (zero fałszywych alarmów), ale recall = 0.70 (30% ataków pominięte).
-
-**Kluczowy wniosek**: Model generalizuje się **bardzo nierówno** między segmentami. AUC jest stabilnie > 0.80, co sugeruje że cechy niosą sygnał, ale rozkład prawdopodobieństw dryfuje drastycznie — stąd ogromna wrażliwość na próg.
+| fold | test rows | F1 @0.5 | precision | recall | AUC |
+|---|---|---|---|---|---|
+| block_0 | 12 496 | 0.671 | 0.544 | 0.877 | 0.863 |
+| block_1 | 6 248 | **0.000** | 0.000 | 0.000 | 0.541 |
+| block_2 | 6 248 | 1.000 | 1.000 | 1.000 | 1.000 |
 
 ---
 
-## 7. Analiza
+## 7. Interpretacja
 
-### 7.1 Dlaczego stratified CV daje F1 = 1.0?
+### 7.1 Kalman wygrywa zdecydowanie
 
-Dane telemetryczne w obrębie jednego segmentu są **silnie autokorelowane** — sąsiednie próbki różnią się minimalnie. Losowy podział rozrzuca te prawie identyczne próbki między train i test. Model po prostu "zapamiętuje" wartości i odnajduje niemal identyczne próbki w teście. To nie jest generalizacja.
+Test innowacji Kalmana (F1 = 0.876) **pokonuje oba modele ML** (F1 ≤ 0.557). Kluczowa przewaga: Kalman wykrywa ataki we **wszystkich foldach**, w tym w block_1 gdzie oba modele ML dają F1 = 0.
 
-### 7.2 Dlaczego block fold 1 to F1 = 0?
+### 7.2 Dlaczego ML zawodzi na block_1?
 
-Segment 4 (attack, indeksy 14 995..18 743) ma **inną sygnaturę** ataku niż segmenty 2 i 6. Model wytrenowany na segmentach 2 i 6 (z segmentami clean 1, 5 i 6) nie potrafi rozpoznać wzorca ataku z segmentu 4.
+Block_1 to segment ataku (indeksy 14 995..18 743) o innej sygnaturze niż segmenty treningowe. Modele ML nauczone na segmentach 2 i 6 nie rozpoznają wzorca z segmentu 4. AUC > 0.5 sugeruje, że sygnał istnieje w predykcjach, ale rozkład prawdopodobieństw dryfuje — próg 0.5 nie trafia.
 
-AUC = 0.80 sugeruje, że model widzi pewien sygnał (ranking jest lepszy niż losowy), ale próg 0.5 nie trafia — wszystkie predykcje dla segment 4 attack są poniżej 0.5.
+### 7.3 Dlaczego Kalman jest lepszy?
 
-### 7.3 Trade-offs
+Kalman opiera się na **fizyce**, nie na wzorcach statystycznych:
+- Pod H0 (brak spoofingu) estymaty EKF i surowy GPS **muszą** się zgadzać w granicach niepewności.
+- Spoofing łamie tę zgodność **niezależnie od typu ataku**.
+- Nie ma co "przefitwować" — brak parametrów uczonych z danych.
 
-| zagadnienie | implikacja |
+### 7.4 Trade-offs
+
+| Zagadnienie | Implikacja |
 |---|---|
-| **Generalizacja** | Model nie generalizuje się równomiernie na wszystkie typy ataków. Nowy, niewidziany typ ataku może nie być wykryty. |
-| **AUC vs F1** | AUC jest stabilnie > 0.80 — sygnał istnieje, ale potrzebna jest lepsza strategia ustawiania progu. |
-| **Jeden dron** | Wyniki dotyczą jednego drona w jednym środowisku. Transferowalność jest ograniczona. |
-| **Brak identyfikacji scenariuszy** | Bez kolumny scenariusza nie możemy przeprowadzić prawdziwego LOSO. |
+| **Kalman vs ML** | Kalman jest lepszy, prostszy i bardziej transferowalny. ML modele nie generalizują na niewidziane typy ataków. |
+| **Generalizacja** | Block_1 ujawnia fundamentalny problem modeli ML: nowy typ ataku = porażka. |
+| **Brak treningu** | Kalman nie wymaga danych z atakami — daje deployment-ready detektor od razu. |
+| **Jeden dron** | Wyniki dla jednego drona. Kalman bardziej transferowalny (fizyka EKF jest ta sama). |
 
 ---
 
@@ -202,22 +203,20 @@ python solution.py
 honeywell_gold_dataset.csv
         │
         ▼
-load_and_clean()  →  usunięcie timestamp, 35 stałych kolumn,
-                      normalizacja GPS, usunięcie kolumn zdrowia odbiornika
+load_and_clean()  →  usunięcie timestamp, 35 stałych, normalizacja GPS
+        │
+        ├──→ kalman_innovation_chi2()  →  χ² score per próbka
+        │                                  ↓
+        │                           evaluate_kalman_block()  →  próg + metryki
         │
         ▼
-add_divergence_features()  →  +14 cech rozjazdu EKF vs GPS,
-                               usunięcie surowych kolumn pozycyjnych
+add_divergence_features()  →  +14 cech rozjazdu, usunięcie surowych pozycji
         │
         ▼
-evaluate_stratified_cv()  →  losowy 4-fold (górny limit)
-evaluate_block_cv()       →  podział po segmentach (realistyczny)
+evaluate_block_cv()  →  XGBoost / LightGBM
         │
         ▼
-XGBoost  →  StandardScaler  →  predict_proba
-        │
-        ▼
-metryki + confusion matrix per fold
+metryki + confusion matrix per fold + porównanie
 ```
 
 ---
@@ -226,14 +225,12 @@ metryki + confusion matrix per fold
 
 | plik | rola |
 |---|---|
-| `solution.py` | **kanoniczny pipeline** — czysty, zweryfikowany, bez leakage |
-| `dataset_description.md` | słownik danych, pułapki, sugerowane cechy |
+| `solution.py` | **kanoniczny pipeline** — 3 metody, bez leakage |
+| `dataset_description.md` | słownik danych, pułapki |
 | `REPORT.md` | ten raport |
 | `requirements.txt` | zależności pip |
 
-**UWAGA**: Pliki `.ipynb` (notebooki) w tym repo zawierają **stary, wadliwy kod** z data leakage, nieprawidłowymi komentarzami o LOSO, i niewywoływanymi funkcjami. Nie są miarodajne. Kanonicznym rozwiązaniem jest `solution.py`.
-
-Kod jest deterministyczny (`random_state=42` wszędzie). Re-egzekucja na świeżym środowisku odtwarza wyniki.
+**UWAGA**: Pliki `.ipynb` zawierają **stary, wadliwy kod** z data leakage i fałszywymi komentarzami. Kanonicznym rozwiązaniem jest `solution.py`.
 
 ```
 pip install -r requirements.txt

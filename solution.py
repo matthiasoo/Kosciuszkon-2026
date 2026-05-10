@@ -8,8 +8,11 @@ Pipeline:
   2. Inzynieria cech — rozjazd EKF vs surowy GPS (cechy fizycznie umotywowane)
   3. Ewaluacja dwoma protokolami:
      a) Stratified 4-fold CV (losowy podzial — latwy test)
-     b) Block-based 3-fold CV (podzial po segmentach — twardy test generalizacji)
-  4. Model: XGBoost (gradient boosting)
+  3. Ewaluacja block-based 3-fold CV (podzial po segmentach — twardy test)
+  4. Modele:
+     - XGBoost (gradient boosting)
+     - LightGBM (gradient boosting)
+     - Test innowacji Kalmana chi-squared (klasyczny, bez ML)
 
 UWAGA: Notebooki .ipynb w tym repo zawieraja stary, wadliwy kod z data leakage
        i falszywe komentarze o LOSO. Ten skrypt jest kanonicznym rozwiazaniem.
@@ -25,6 +28,7 @@ from sklearn.metrics import (f1_score, roc_auc_score, accuracy_score,
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import StratifiedKFold
 from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
 
 
 # =============================================================================
@@ -151,6 +155,119 @@ META_COLS = [LABEL_COL, 'segment', 'block_fold']
 def get_feature_cols(df):
     """Zwraca nazwy kolumn cech (wszystko co nie jest metadana/label)."""
     return [c for c in df.columns if c not in META_COLS]
+
+
+# =============================================================================
+# 5. DETEKTOR KLASYCZNY — TEST INNOWACJI KALMANA (chi-squared)
+# =============================================================================
+
+def kalman_innovation_chi2(df_raw):
+    """
+    Test innowacji Kalmana: porownuje estymaty EKF z surowym GPS
+    i normalizuje rozjazd raportowana niepewnoscia GPS.
+
+    chi2 = (dn^2 + de^2) / eph^2 + dd^2 / epv^2
+
+    Pod H0 (brak spoofingu) chi2 ~ chi2(3).
+    Spoofing lamania zgodnosc EKF/GPS, wiec chi2 rosnie.
+
+    Ta metoda NIE wymaga treningu (brak ML). Jest fizycznie umotywowana.
+    Wymaga surowych kolumn pozycyjnych (lat_x/y, lon_x/y, alt_x/y)
+    i niepewnosci GPS (eph_y, epv_y), wiec operuje na df_raw (po load_and_clean,
+    przed add_divergence_features).
+    """
+    cos_lat = np.cos(np.radians(df_raw['lat_x']))
+    dn = (df_raw['lat_x'] - df_raw['lat_y']) * 111_000.0
+    de = (df_raw['lon_x'] - df_raw['lon_y']) * 111_000.0 * cos_lat
+    dd = df_raw['alt_x'] - df_raw['alt_y']
+
+    eph = df_raw['eph_y'].clip(lower=0.1)  # floor na 10cm
+    epv = df_raw['epv_y'].clip(lower=0.1)
+
+    chi2 = (dn**2 + de**2) / eph**2 + dd**2 / epv**2
+    return chi2
+
+
+def evaluate_kalman_block(df_raw, thresholds=None):
+    """
+    Ewaluacja testu innowacji Kalmana na block-based foldach.
+    Kalman nie wymaga treningu — liczymy chi2 na calym zbiorze,
+    ale metryki raportujemy per block dla spojnosci z ML modelami.
+
+    Progi: 95% kwantyl chi2(3) = 7.81 (domyslny) + kalibrowany.
+    """
+    from scipy.stats import chi2 as chi2_dist
+
+    df = assign_block_folds(df_raw)
+    chi2_scores = kalman_innovation_chi2(df)
+
+    # Domyslny prog: 95% kwantyl chi2 z 3 stopniami swobody
+    default_threshold = chi2_dist.ppf(0.95, df=3)  # = 7.815
+
+    rows = []
+    n_folds = df['block_fold'].nunique()
+
+    for fold_idx in range(n_folds):
+        mask_te = df['block_fold'] == fold_idx
+        yte = df.loc[mask_te, 'label'].values
+        chi2_te = chi2_scores[mask_te].values
+
+        # Predykcja: chi2 > prog => spoofing
+        pred_default = (chi2_te > default_threshold).astype(int)
+
+        # Kalibracja: prog na danych treningowych
+        mask_tr = ~mask_te
+        ytr = df.loc[mask_tr, 'label'].values
+        chi2_tr = chi2_scores[mask_tr].values
+
+        best_thr = default_threshold
+        best_f1 = 0
+        for thr in np.linspace(0.1, 50, 500):
+            p = (chi2_tr > thr).astype(int)
+            f = f1_score(ytr, p, zero_division=0)
+            if f > best_f1:
+                best_f1 = f
+                best_thr = thr
+
+        pred_calibrated = (chi2_te > best_thr).astype(int)
+
+        f1_def = f1_score(yte, pred_default, zero_division=0)
+        f1_cal = f1_score(yte, pred_calibrated, zero_division=0)
+
+        # AUC: chi2_score jako "probability" (wyzszy = bardziej podejrzany)
+        auc = roc_auc_score(yte, chi2_te)
+
+        rows.append({
+            'fold': f'block_{fold_idx}',
+            'test_rows': int(mask_te.sum()),
+            'test_pos_rate': float(yte.mean()),
+            'threshold_default': default_threshold,
+            'threshold_cal': best_thr,
+            'f1_default': f1_def,
+            'f1_calibrated': f1_cal,
+            'precision': precision_score(yte, pred_calibrated, zero_division=0),
+            'recall': recall_score(yte, pred_calibrated, zero_division=0),
+            'roc_auc': auc,
+        })
+
+        cm = confusion_matrix(yte, pred_calibrated)
+        print(f"\n  Block fold {fold_idx} (test: {int(mask_te.sum())} rows, "
+              f"pos_rate={yte.mean():.2f}, thr_cal={best_thr:.2f}):")
+        print(f"    F1 @7.81={f1_def:.3f}  F1 @cal={f1_cal:.3f}")
+        print(f"    Confusion matrix: TN={cm[0,0]} FP={cm[0,1]} FN={cm[1,0]} TP={cm[1,1]}")
+
+    results = pd.DataFrame(rows)
+    mean = results[['f1_default','f1_calibrated','precision','recall','roc_auc']].mean()
+    print(f"\n{'='*60}")
+    print(f"  Kalman chi2 — Block-based 3-Fold (REALISTYCZNY)")
+    print(f"{'='*60}")
+    print(results[['fold','test_rows','test_pos_rate','threshold_cal',
+                   'f1_default','f1_calibrated','precision','recall','roc_auc']].round(3).to_string(index=False))
+    print(f"  Srednia:  F1@7.81={mean['f1_default']:.3f}  "
+          f"F1@cal={mean['f1_calibrated']:.3f}  "
+          f"P={mean['precision']:.3f}  R={mean['recall']:.3f}  "
+          f"AUC={mean['roc_auc']:.3f}")
+    return results
 
 
 # =============================================================================
@@ -297,6 +414,20 @@ def make_xgb():
     )
 
 
+def make_lgbm():
+    return LGBMClassifier(
+        n_estimators=600,
+        learning_rate=0.04,
+        num_leaves=63,
+        min_child_samples=20,
+        reg_alpha=0.1,
+        reg_lambda=0.1,
+        random_state=42,
+        n_jobs=-1,
+        verbose=-1,
+    )
+
+
 # =============================================================================
 # MAIN
 # =============================================================================
@@ -323,28 +454,35 @@ if __name__ == '__main__':
     assert 'lat_x' not in df.columns, "lat_x nie powinien byc w danych!"
     assert 'label' not in feature_cols, "label nie powinien byc w cechach!"
 
-    # 3. Ewaluacja — Stratified CV (latwy test)
+    # 3. Block CV — XGBoost
     print(f"\n{'#'*60}")
-    print(f"  PROTOKOL A: STRATIFIED 4-FOLD CV (losowy podzial)")
+    print(f"  BLOCK-BASED 3-FOLD CV (podzial po segmentach)")
+    print(f"  Realistyczny test: model testowany na sesji ktorej nie widzial.")
     print(f"{'#'*60}")
-    results_strat = evaluate_stratified_cv(df, make_xgb, name="XGBoost + divergence")
 
-    # 4. Ewaluacja — Block CV (twardy test)
+    results_xgb = evaluate_block_cv(df, make_xgb, name="XGBoost")
+
+    # 4. Block CV — LightGBM
+    results_lgbm = evaluate_block_cv(df, make_lgbm, name="LightGBM")
+
+    # 5. Kalman chi-squared (klasyczny, bez ML)
     print(f"\n{'#'*60}")
-    print(f"  PROTOKOL B: BLOCK-BASED 3-FOLD CV (podzial po segmentach)")
-    print(f"  Twardy test: model nigdy nie widzial danych z testowanego")
-    print(f"  segmentu czasowego lotu.")
+    print(f"  KALMAN CHI-SQUARED (klasyczny detektor, bez treningu)")
     print(f"{'#'*60}")
-    results_block = evaluate_block_cv(df, make_xgb, name="XGBoost + divergence")
+    results_kalman = evaluate_kalman_block(df_raw)
 
-    # 5. Podsumowanie
+    # 6. Porownanie modeli
     print(f"\n{'='*60}")
-    print(f"  POROWNANIE")
+    print(f"  POROWNANIE MODELI (Block CV — realistyczny)")
     print(f"{'='*60}")
-    strat_mean = results_strat[['f1','precision','recall','roc_auc']].mean()
-    block_mean = results_block[['f1_default','f1_calibrated','precision','recall','roc_auc']].mean()
-    print(f"  Stratified CV:    F1={strat_mean['f1']:.3f}  AUC={strat_mean['roc_auc']:.3f}  (zawyzone)")
-    print(f"  Block CV @0.5:    F1={block_mean['f1_default']:.3f}  AUC={block_mean['roc_auc']:.3f}")
-    print(f"  Block CV @cal:    F1={block_mean['f1_calibrated']:.3f}  AUC={block_mean['roc_auc']:.3f}")
-    print(f"\n  Block CV jest realistycznym testem — mierzy generalizacje")
-    print(f"  miedzy roznymi sesjami lotowymi.")
+    all_results = {
+        'XGBoost': results_xgb,
+        'LightGBM': results_lgbm,
+        'Kalman chi2': results_kalman,
+    }
+    for name, res in all_results.items():
+        m = res[['f1_default','f1_calibrated','precision','recall','roc_auc']].mean()
+        print(f"  {name:12s}  F1@def={m['f1_default']:.3f}  "
+              f"F1@cal={m['f1_calibrated']:.3f}  "
+              f"P={m['precision']:.3f}  R={m['recall']:.3f}  "
+              f"AUC={m['roc_auc']:.3f}")

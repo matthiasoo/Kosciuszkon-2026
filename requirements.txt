@@ -2,6 +2,7 @@ numpy
 matplotlib
 pandas
 scikit-learn
+scipy
 xgboost
 lightgbm
 catboost
