@@ -1,23 +1,3 @@
-"""
-Detekcja GPS Spoofing — Kosciuszkon 2026
-========================================
-Kanoniczne rozwiazanie. Przewiduje kolumne `label` (0 = czysty lot, 1 = spoofing).
-
-Pipeline:
-  1. Czyszczenie danych (usuniecie timestamp, 35 stalych kolumn, normalizacja GPS)
-  2. Inzynieria cech — rozjazd EKF vs surowy GPS (cechy fizycznie umotywowane)
-  3. Ewaluacja dwoma protokolami:
-     a) Stratified 4-fold CV (losowy podzial — latwy test)
-  3. Ewaluacja block-based 3-fold CV (podzial po segmentach — twardy test)
-  4. Modele:
-     - XGBoost (gradient boosting)
-     - LightGBM (gradient boosting)
-     - Test innowacji Kalmana chi-squared (klasyczny, bez ML)
-
-UWAGA: Notebooki .ipynb w tym repo zawieraja stary, wadliwy kod z data leakage
-       i falszywe komentarze o LOSO. Ten skrypt jest kanonicznym rozwiazaniem.
-"""
-
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -33,16 +13,15 @@ from sklearn.model_selection import StratifiedKFold
 from xgboost import XGBClassifier
 from lightgbm import LGBMClassifier
 
-# ---- STYL WIZUALNY (konsekwentny na wszystkich wykresach) ----
 PLOT_STYLE = {
     'bg_color': '#1a1a2e',
     'text_color': '#e0e0e0',
     'grid_color': '#333355',
-    'color_clean': '#4fc3f7',     # jasny niebieski = czysty lot
-    'color_spoof': '#ef5350',     # czerwony = spoofing
-    'color_kalman': '#66bb6a',    # zielony
-    'color_xgb': '#ffa726',       # pomaranczowy
-    'color_lgbm': '#ab47bc',      # fioletowy
+    'color_clean': '#4fc3f7',
+    'color_spoof': '#ef5350',
+    'color_kalman': '#66bb6a',
+    'color_xgb': '#ffa726',
+    'color_lgbm': '#ab47bc',
     'font_title': 14,
     'font_label': 11,
     'font_tick': 9,
@@ -50,7 +29,6 @@ PLOT_STYLE = {
 }
 
 def setup_plot_style():
-    """Konfiguracja ciemnego motywu dla wszystkich wykresow."""
     plt.rcParams.update({
         'figure.facecolor': PLOT_STYLE['bg_color'],
         'axes.facecolor': '#16213e',
@@ -73,16 +51,13 @@ def setup_plot_style():
 
 setup_plot_style()
 
-
-# =============================================================================
-# 1. WCZYTANIE I CZYSZCZENIE DANYCH
-# =============================================================================
-
-def load_and_clean(path='honeywell_gold_dataset.csv'):
-    """Wczytaj dane i usun nieprzydatne kolumny."""
+# Wczytanie i czyszczenie danych
+def load_and_clean(path='../data/honeywell_gold_dataset.csv'):
+    """
+    Wczytuje dane i usuwa niepotrzebne kolumny.
+    """
     df = pd.read_csv(path)
 
-    # 35 kolumn stalych — nie niosą zadnego sygnalu
     CONST_COLS = [
         'delta_q_reset[0]', 'delta_q_reset[1]', 'delta_q_reset[2]', 'delta_q_reset[3]',
         'quat_reset_counter', 'delta_alt', 'lat_lon_reset_counter', 'alt_reset_counter',
@@ -96,15 +71,13 @@ def load_and_clean(path='honeywell_gold_dataset.csv'):
         'heading_reset_counter', 'xy_global', 'z_global',
     ]
 
-    # timestamp to indeks probki, nie czas — wycieka informacje o segmencie
+    # timestamp = indeks probki
     DROP = ['timestamp'] + CONST_COLS
-
-    # Kolumny zdrowia odbiornika — nie separuja spoofingu w tym datasecie
     DROP += ['jamming_indicator', 'noise_per_ms', 'satellites_used']
 
     df = df.drop(columns=[c for c in DROP if c in df.columns])
 
-    # Normalizacja jednostek GPS (surowy GPS jest w deg*1e7 / mm)
+    # normalizacja
     df['lat_y'] = df['lat_y'] / 1e7
     df['lon_y'] = df['lon_y'] / 1e7
     df['alt_y'] = df['alt_y'] / 1000.0
@@ -112,20 +85,14 @@ def load_and_clean(path='honeywell_gold_dataset.csv'):
 
     return df
 
-
-# =============================================================================
-# 2. INZYNIERIA CECH — ROZJAZD EKF vs GPS
-# =============================================================================
-
+# Inżynieria cech
 def add_divergence_features(df):
     """
-    Oblicza rozjazd miedzy estymata EKF (kolumny *_x) a surowym GPS (*_y).
-    Pod hipoteza zerowa (brak spoofingu) rozjazd powinien byc bliski zeru.
-    Spoofing lamania te zgodnosc.
+    Oblicza różnicę między przewidywanym położeniem drona (filtr kalmana) i jego faktyczną lokalizacją z GPS.
     """
     df = df.copy()
 
-    # Rozjazd pozycyjny w metrach
+    # Różnica położenia
     cos_lat = np.cos(np.radians(df['lat_x']))
     df['lat_diff_m'] = (df['lat_x'] - df['lat_y']) * 111_000.0
     df['lon_diff_m'] = (df['lon_x'] - df['lon_y']) * 111_000.0 * cos_lat
@@ -134,24 +101,23 @@ def add_divergence_features(df):
     df['pos_diff_h_m'] = np.sqrt(df['lat_diff_m']**2 + df['lon_diff_m']**2)
     df['pos_diff_3d_m'] = np.sqrt(df['pos_diff_h_m']**2 + df['alt_diff_m']**2)
 
-    # Rozjazd predkosci (lokalny NED vs GPS NED)
+    # Różnica prędkości
     df['vn_diff'] = df['vx'] - df['vel_n_m_s']
     df['ve_diff'] = df['vy'] - df['vel_e_m_s']
     df['vd_diff'] = df['vz'] - df['vel_d_m_s']
     df['vel_diff_h'] = np.sqrt(df['vn_diff']**2 + df['ve_diff']**2)
     df['vel_diff_3d'] = np.sqrt(df['vel_diff_h']**2 + df['vd_diff']**2)
 
-    # Rozjazd predkosci skalarne
+    # Różnica prędkości skalarnych
     df['speed_local'] = np.sqrt(df['vx']**2 + df['vy']**2 + df['vz']**2)
     df['speed_diff'] = df['speed_local'] - df['vel_m_s']
 
-    # Rozjazd kursu
+    # Różnica w kursie
     cog_local = np.arctan2(df['vy'], df['vx'])
     df['cog_diff'] = (df['cog_rad'] - cog_local + np.pi) % (2*np.pi) - np.pi
     df['abs_cog_diff'] = df['cog_diff'].abs()
 
-    # Usuwamy surowe kolumny pozycyjne — model NIE powinien ich widziec bezposrednio
-    # (identyfikuja segment = leakage przy losowym CV)
+    # Usunięcie surowych danych lokalizacyjnych
     DROP_RAW_POS = ['lat_x', 'lon_x', 'alt_x', 'alt_ellipsoid_x',
                     'lat_y', 'lon_y', 'alt_y', 'alt_ellipsoid_y',
                     'x', 'y', 'z']
@@ -160,14 +126,11 @@ def add_divergence_features(df):
     return df
 
 
-# =============================================================================
-# 3. IDENTYFIKACJA SEGMENTOW (dla block-based CV)
-# =============================================================================
-
+# Identyfikacja segmentów
 def assign_segments(df):
     """
-    Dataset sklada sie z 6 ciaglych blokow (3x clean, 3x attack).
-    Przypisuje numer segmentu kazdemu wierszowi.
+    Dataset składa się z 6 ciągłych bloków (3x clean, 3x attack).
+    Przypisuje numer segmentu każdemu wierszowi.
     """
     changes = df['label'].diff().ne(0).cumsum()
     df = df.copy()
@@ -177,10 +140,7 @@ def assign_segments(df):
 
 def assign_block_folds(df):
     """
-    Laczy sasiednie segmenty clean+attack w 3 foldy.
-    Fold 0: segmenty 1+2 (clean + attack)
-    Fold 1: segmenty 3+4 (clean + attack)
-    Fold 2: segmenty 5+6 (clean + attack)
+    Łączy segmenty w foldy
     """
     df = assign_segments(df)
     seg_to_fold = {1: 0, 2: 0, 3: 1, 4: 1, 5: 2, 6: 2}
@@ -188,21 +148,12 @@ def assign_block_folds(df):
     return df
 
 
-# =============================================================================
-# 4. LISTA CECH I ICH WYTŁUMACZENIE (Feature Selection & Rationale)
-# =============================================================================
-
+# Lista cech
 LABEL_COL = 'label'
 META_COLS = [LABEL_COL, 'segment', 'block_fold']
 
-# ZGODNIE Z WYMAGANIAMI: Każda wybrana cecha ma wytłumaczenie, czemu została
-# wybrana do predykcji. Selekcja ta pozwala uniknąć Data Leakage (wycieku danych),
-# ponieważ model nie widzi bezwzględnych współrzędnych geograficznych ani prędkości,
-# które mogłyby identyfikować konkretny lot.
 SELECTED_FEATURES = {
-    # --- CECHY INNOWACJI (ROZJAZD SENSORÓW: EKF vs GPS) ---
-    # Podstawa detekcji: w trakcie ataku spoofingowego, odczyty z zakłócanego GPS
-    # przestają zgadzać się z modelem fizycznym i pomiarami inercyjnymi drona (IMU).
+    # Cechy innowacyjne
     'pos_diff_h_m': "Rozjazd pozycji w poziomie (horyzontalny) między EKF a GPS. Kluczowy wskaźnik ściągania drona z trasy.",
     'pos_diff_3d_m': "Całkowity (3D) rozjazd pozycji w metrach. Spoofing często zaburza również estymację wysokości (Z).",
     'vel_diff_h': "Rozjazd wektora prędkości w poziomie. Pozwala szybko wykryć atak zanim nastąpi duży dryf pozycji (anomalia pochodnej ruchu).",
@@ -210,9 +161,7 @@ SELECTED_FEATURES = {
     'speed_diff': "Różnica w skalarnej prędkości drona. Prosta miara pokazująca, że odbiornik GPS podaje prędkość fizycznie niemożliwą do osiągnięcia w danym momencie.",
     'abs_cog_diff': "Bezwzględna różnica kursu (Course Over Ground). Spoofer często wymusza wektor prędkości o kącie niezgodnym z faktycznym zwrotem (headingiem) i ruchem maszyny.",
     
-    # --- CECHY JAKOŚCI SYGNAŁU GPS I GEOMETRII ---
-    # Atak spoofingowy sztucznie podmienia satelity, co nierzadko powoduje skoki w 
-    # estymowanej dokładności i geometriach satelitów raportowanych przez sam odbiornik.
+    # Cechy jakości sygnału GPS
     'eph_y': "Estymowany błąd horyzontalny GPS (Expected Position Error). Wybrany, ponieważ często skacze lub drastycznie maleje w momencie przejmowania sygnału przez spoofera.",
     'epv_y': "Estymowany błąd wertykalny GPS. Działa jak wyżej, sygnalizując nienormalne zaufanie lub brak zaufania do rozwiązania wysokościowego.",
     'hdop': "Horizontal Dilution of Precision. Wybrano ją, bo spooferzy z jednym nadajnikiem psują geometrię poziomą (sygnały przychodzą z jednego kierunku), co zaburza HDOP.",
@@ -220,9 +169,7 @@ SELECTED_FEATURES = {
     's_variance_m_s': "Wariancja prędkości z odbiornika GPS. Rosnąca wariancja demaskuje szum i niestabilność pętli śledzenia PLL/DLL podczas ataku.",
     'c_variance_rad': "Wariancja kursu z odbiornika. Ujawnia utratę stabilnego lock-a na nośnej (carrier phase) z powodu sygnałów zagłuszających (jamming towarzyszący).",
     
-    # --- CECHY DYNAMIKI LOTU (IMU) ---
-    # Jeśli dron dostanie zły GPS, uważa, że zdmuchnął go wiatr i próbuje to korygować, 
-    # co skutkuje gwałtownym pochyleniem i przyspieszeniem maszyn.
+    # Cechy dynamiki lotu
     'ax': "Akceleracja osi X. Rejestruje nagłe szarpnięcia do przodu/tyłu gdy kontroler próbuje nadrobić 'utraconą' wg fałszywego GPS pozycję.",
     'ay': "Akceleracja osi Y. Rejestruje szarpnięcia boczne na skutek prób powrotu na trajektorię odchyloną przez atak.",
     'az': "Akceleracja osi Z. Ujawnia próby gwałtownej korekty wysokości wywołanej m.in. sztucznym meandrowaniem sygnału w osi D."
@@ -230,21 +177,16 @@ SELECTED_FEATURES = {
 
 def get_feature_cols(df):
     """
-    Zwraca nazwy scisle wyselekcjonowanych kolumn cech (whitelist) uzywanych do predykcji ML.
-    Model otrzymuje wylacznie te cechy, ktore maja mocne fizyczne i analityczne uzasadnienie.
+    Zwraca nazwy wyselekcjonowanych kolumn cech używanych do predykcji ML.
     """
     selected = list(SELECTED_FEATURES.keys())
     return [col for col in selected if col in df.columns]
 
 
-# =============================================================================
-# 4b. WIZUALIZACJA DYSTRYBUCJI CECH
-# =============================================================================
-
-def plot_feature_distributions(df, save_path='plots_distributions.png'):
+# Wizualizacja dystrybucji cech
+def plot_feature_distributions(df, save_path='../visualization/plots_distributions.png'):
     """
-    Generuje histogramy dystrybucji wybranych cech, podzielone na label=0 (clean)
-    i label=1 (spoofing). Pozwala wizualnie ocenic separowalnosc klas.
+    Generuje histogramy dystrybucji wybranych cech.
     """
     features = get_feature_cols(df)
     n = len(features)
@@ -269,7 +211,6 @@ def plot_feature_distributions(df, save_path='plots_distributions.png'):
         if idx == 0:
             ax.legend(fontsize=PLOT_STYLE['font_tick'])
 
-    # Ukryj puste subploty
     for idx in range(n, nrows * ncols):
         axes.flat[idx].set_visible(False)
 
@@ -279,14 +220,10 @@ def plot_feature_distributions(df, save_path='plots_distributions.png'):
     plt.close(fig)
 
 
-# =============================================================================
-# 4c. MACIERZ POMYLEK (Confusion Matrix)
-# =============================================================================
-
-def plot_confusion_matrices(cm_dict, save_path='plots_confusion_matrices.png'):
+# Macierz pomyłek
+def plot_confusion_matrices(cm_dict, save_path='../visualization/plots_confusion_matrices.png'):
     """
-    Rysuje macierze pomylek dla wszystkich modeli side-by-side.
-    cm_dict: {'Model Name': {'block_0': cm, 'block_1': cm, 'block_2': cm, 'total': cm}}
+    Rysuje macierze pomylek dla wszystkich modeli.
     """
     models = list(cm_dict.keys())
     n_models = len(models)
@@ -324,25 +261,8 @@ def plot_confusion_matrices(cm_dict, save_path='plots_confusion_matrices.png'):
     print(f"  [PLOT] Macierze pomylek -> {save_path}")
     plt.close(fig)
 
-# =============================================================================
-# 5. DETEKTOR KLASYCZNY — TEST INNOWACJI KALMANA (chi-squared)
-# =============================================================================
-
+# Detekcja klasyczna - filtr kalmana
 def kalman_innovation_chi2(df_raw):
-    """
-    Test innowacji Kalmana: porownuje estymaty EKF z surowym GPS
-    i normalizuje rozjazd raportowana niepewnoscia GPS.
-
-    chi2 = (dn^2 + de^2) / eph^2 + dd^2 / epv^2
-
-    Pod H0 (brak spoofingu) chi2 ~ chi2(3).
-    Spoofing lamania zgodnosc EKF/GPS, wiec chi2 rosnie.
-
-    Ta metoda NIE wymaga treningu (brak ML). Jest fizycznie umotywowana.
-    Wymaga surowych kolumn pozycyjnych (lat_x/y, lon_x/y, alt_x/y)
-    i niepewnosci GPS (eph_y, epv_y), wiec operuje na df_raw (po load_and_clean,
-    przed add_divergence_features).
-    """
     cos_lat = np.cos(np.radians(df_raw['lat_x']))
     dn = (df_raw['lat_x'] - df_raw['lat_y']) * 111_000.0
     de = (df_raw['lon_x'] - df_raw['lon_y']) * 111_000.0 * cos_lat
@@ -354,21 +274,13 @@ def kalman_innovation_chi2(df_raw):
     chi2 = (dn**2 + de**2) / eph**2 + dd**2 / epv**2
     return chi2
 
-
+# Ewaluacja klasycznej detekcji filtrem kalmana
 def evaluate_kalman_block(df_raw, thresholds=None):
-    """
-    Ewaluacja testu innowacji Kalmana na block-based foldach.
-    Kalman nie wymaga treningu — liczymy chi2 na calym zbiorze,
-    ale metryki raportujemy per block dla spojnosci z ML modelami.
-
-    Progi: 95% kwantyl chi2(3) = 7.81 (domyslny) + kalibrowany.
-    """
     from scipy.stats import chi2 as chi2_dist
 
     df = assign_block_folds(df_raw)
     chi2_scores = kalman_innovation_chi2(df)
 
-    # Domyslny prog: 95% kwantyl chi2 z 3 stopniami swobody
     default_threshold = chi2_dist.ppf(0.95, df=3)  # = 7.815
 
     rows = []
@@ -381,10 +293,10 @@ def evaluate_kalman_block(df_raw, thresholds=None):
         yte = df.loc[mask_te, 'label'].values
         chi2_te = chi2_scores[mask_te].values
 
-        # Predykcja: chi2 > prog => spoofing
+        # Predykcja
         pred_default = (chi2_te > default_threshold).astype(int)
 
-        # Kalibracja: prog na danych treningowych
+        # Kalibracja
         mask_tr = ~mask_te
         ytr = df.loc[mask_tr, 'label'].values
         chi2_tr = chi2_scores[mask_tr].values
@@ -403,7 +315,6 @@ def evaluate_kalman_block(df_raw, thresholds=None):
         f1_def = f1_score(yte, pred_default, zero_division=0)
         f1_cal = f1_score(yte, pred_calibrated, zero_division=0)
 
-        # AUC: chi2_score jako "probability" (wyzszy = bardziej podejrzany)
         auc = roc_auc_score(yte, chi2_te)
 
         rows.append({
@@ -442,17 +353,10 @@ def evaluate_kalman_block(df_raw, thresholds=None):
     return results, cm_dict
 
 
-# =============================================================================
-# 5. EWALUACJA
-# =============================================================================
-
+# Ewaluacja
 def evaluate_stratified_cv(df, make_model, n_splits=4, name="Model"):
     """
     Stratified K-Fold CV z losowym podzialem.
-    UWAGA: Daje zawyzone wyniki (F1 ~ 1.0) bo sasiednie probki w tym samym
-    segmencie sa prawie identyczne — losowy podzial rozrzuca je miedzy
-    train i test, co jest de facto data leakage. Raportujemy to jako
-    gorny limit, NIE jako realistyczny wynik.
     """
     feature_cols = get_feature_cols(df)
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
@@ -493,7 +397,7 @@ def evaluate_stratified_cv(df, make_model, n_splits=4, name="Model"):
 
 
 def calibrate_threshold(y_true, proba):
-    """Znajdz prog maksymalizujacy F1 na danych kalibracyjnych."""
+    """Znajduje prog maksymalizujacy F1 na danych kalibracyjnych."""
     from sklearn.metrics import precision_recall_curve
     prec, rec, thresholds = precision_recall_curve(y_true, proba)
     f1s = 2 * prec * rec / (prec + rec + 1e-12)
@@ -504,12 +408,6 @@ def calibrate_threshold(y_true, proba):
 def evaluate_block_cv(df, make_model, name="Model"):
     """
     Block-based 3-Fold CV — podzial po segmentach (ciagłych blokach danych).
-    Twardy test generalizacji: model nigdy nie widzial danych z testowanego
-    segmentu czasowego lotu. Nie ma leakage z sasiedztwa probek.
-
-    Kalibracja progu: prog decyzyjny wyznaczany z OOF predictions na foldach
-    treningowych (bez przecieku z testu). To pomaga gdy rozklad prawdopodobienstw
-    dryfuje miedzy segmentami.
     """
     df = assign_block_folds(df)
     feature_cols = get_feature_cols(df)
@@ -574,10 +472,7 @@ def evaluate_block_cv(df, make_model, name="Model"):
     return results, cm_dict
 
 
-# =============================================================================
-# 6. MODEL
-# =============================================================================
-
+# Modele
 def make_xgb():
     return XGBClassifier(
         n_estimators=400,
@@ -604,29 +499,24 @@ def make_lgbm():
         verbose=-1,
     )
 
-
-# =============================================================================
-# MAIN
-# =============================================================================
-
 if __name__ == '__main__':
     print("="*60)
     print("  DETEKCJA GPS SPOOFING — KOSCIUSZKON 2026")
     print("="*60)
 
-    # 1. Wczytaj i wyczysc dane
+    # 1. Wczytaj i wyczyść dane
     df_raw = load_and_clean()
     print(f"\n[1] Dane po czyszczeniu: {df_raw.shape}")
     print(f"    Label: {df_raw['label'].value_counts().to_dict()}")
 
-    # 2. Dodaj cechy rozjazdu
+    # 2. Dodaj cechy
     df = add_divergence_features(df_raw)
     feature_cols = get_feature_cols(df)
     print(f"\n[2] Dane po inzynierii cech: {df.shape}")
     print(f"    Cechy: {len(feature_cols)}")
     print(f"    Nazwy: {feature_cols}")
 
-    # Sprawdz ze nie ma leakage
+    # Sprawdź że nie ma wycieku danych
     assert 'timestamp' not in df.columns, "timestamp nie powinien byc w danych!"
     assert 'lat_x' not in df.columns, "lat_x nie powinien byc w danych!"
     assert 'label' not in feature_cols, "label nie powinien byc w cechach!"
@@ -648,13 +538,13 @@ if __name__ == '__main__':
     # 5. Block CV — LightGBM
     results_lgbm, cm_lgbm = evaluate_block_cv(df, make_lgbm, name="LightGBM")
 
-    # 6. Kalman chi-squared (klasyczny, bez ML)
+    # 6. Kalman
     print(f"\n{'#'*60}")
     print(f"  KALMAN CHI-SQUARED (klasyczny detektor, bez treningu)")
     print(f"{'#'*60}")
     results_kalman, cm_kalman = evaluate_kalman_block(df_raw)
 
-    # 7. Macierze pomylek
+    # 7. Macierze pomyłek
     print(f"\n{'#'*60}")
     print(f"  MACIERZE POMYLEK")
     print(f"{'#'*60}")
@@ -665,7 +555,7 @@ if __name__ == '__main__':
     }
     plot_confusion_matrices(cm_all)
 
-    # 8. Porownanie modeli
+    # 8. Porównanie modeli
     print(f"\n{'='*60}")
     print(f"  POROWNANIE MODELI (Block CV — realistyczny)")
     print(f"{'='*60}")
