@@ -8,25 +8,23 @@ Real autopilot telemetry merged from PX4 uORB topics (`vehicle_attitude`, `vehic
 |---|---|
 | File | `honeywell_gold_dataset.csv` |
 | Rows | 24,992 |
-| Columns | 85 (83 features + 2 targets: `label`, `scenario_type`) |
+| Columns | 84 (83 features + 1 target: `label`) |
 | Nulls | 0 |
 | Drones | 1 |
 | Reference origin | `ref_lat=36.2048055, ref_lon=138.2529121, ref_alt=51.6988 m` |
 
-### Scenario layout (concatenated, not interleaved)
+### Label distribution
 
-| scenario_type | row range | n | label=1 | first label=1 within block |
-|---|---|---|---|---|
-| `clean_flight` | 0 .. 6 247 | 6 248 | 0 (0%) | – |
-| `horizontal_drift` | 6 248 .. 12 495 | 6 248 | 4 374 (70%) | row 1 874 |
-| `altitude_spoof` | 12 496 .. 18 743 | 6 248 | 3 749 (60%) | row 2 499 |
-| `circular_spoof` | 18 744 .. 24 991 | 6 248 | 4 999 (80%) | row 1 249 |
+| label | count | fraction |
+|---|---|---|
+| 0 | 11 870 | 47.5% |
+| 1 | 13 122 | 52.5% |
 
-Each attack scenario starts with a clean takeoff/preamble (`label=0`); the spoofing window begins at the row noted above and runs to the end of the block.
+The dataset contains rows from four contiguous flight blocks (each 6 248 rows). Some blocks are entirely clean (`label=0`), while others contain spoofing windows where `label=1`.
 
 ## Important caveats
 
-1. **Train/test splitting** — the four scenarios are stored as four contiguous blocks, *not* shuffled. A random `train_test_split` will leak rows from the same scenario into both folds and inflate scores. Use `GroupKFold` keyed by `scenario_type`, or a leave-one-scenario-out split.
+1. **Train/test splitting** — the data is stored as four contiguous blocks, *not* shuffled. A random `train_test_split` may leak rows from the same flight block into both folds and inflate scores. Consider using block-aware splitting strategies.
 2. **`timestamp` is a sample index, not real time.** It runs `0..24991` with step 1 inside each block (not a wall clock). `time_utc_usec` and `timestamp_time_relative` are constant zero in this file, so there is no absolute time reference. If sampling rate matters for your features, treat the index as ticks and assume PX4-typical 50 Hz / 100 Hz.
 3. **35 of 85 columns are constant** in this file (mostly EKF reset counters and validity flags). They carry no information; drop them up front. The full list is at the bottom of this document.
 4. **EKF (`*_x`) and raw GPS (`*_y`) use different units**:
@@ -125,15 +123,10 @@ Local NED frame anchored at `ref_lat / ref_lon / ref_alt`.
 - **`z_global`** — local z is tied to the global frame (constant `1`).
 - **`dist_bottom_valid`** — `dist_bottom` is valid (constant `1.0`).
 
-### Targets
+### Target
 - **`label`** — binary anomaly flag for this row.
   - `1` — spoofing window active in this sample.
   - `0` — clean (during clean flights, or before the spoofing onset in attack scenarios).
-- **`scenario_type`** — categorical scenario the row belongs to. One of:
-  - `clean_flight` — nominal flight, no spoofing.
-  - `horizontal_drift` — slow lateral drift in the spoofed GPS (lat/lon walks away from EKF estimate).
-  - `altitude_spoof` — vertical-only attack: altitude reading is biased while horizontal stays plausible.
-  - `circular_spoof` — spoofed position traces a circular pattern divorced from the real trajectory.
 
 ## Constant columns to drop up front
 

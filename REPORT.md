@@ -36,22 +36,20 @@ W datasecie reprezentowane są **trzy realistyczne scenariusze spoofingu** plus 
 | | |
 |---|---|
 | Wiersze | 24 992 |
-| Kolumny | 85 (83 cechy + 2 etykiety: `label`, `scenario_type`) |
+| Kolumny | 84 (83 cechy + 1 etykieta: `label`) |
 | Brakujące wartości | 0 |
 | Duplikaty | 0 |
 | Drony | 1, jedno środowisko |
 | Punkt referencyjny | `36.2048°N, 138.2529°E, 51.7 m` |
 
-**Układ scenariuszy** (sklejone bloki, nie przeplatane):
+**Rozkład etykiety** `label`:
 
-| scenario_type | wiersze | udział label=1 | start ataku (w bloku) |
-|---|---|---|---|
-| `clean_flight` | 6 248 | 0 % | – |
-| `horizontal_drift` | 6 248 | 70 % | wiersz 1 874 |
-| `altitude_spoof` | 6 248 | 60 % | wiersz 2 499 |
-| `circular_spoof` | 6 248 | 80 % | wiersz 1 249 |
+| label | wiersze | udział |
+|---|---|---|
+| 0 | 11 870 | 47,5% |
+| 1 | 13 122 | 52,5% |
 
-**Pokrycie**: trzy różne sygnatury ataków plus baseline. Każdy scenariusz ataku zawiera zarówno czysty preambuł, jak i okno aktywnego ataku — obie klasy obecne w każdym scenariuszu (poza `clean_flight`).
+**Pokrycie**: dane zawierają zarówno czyste loty, jak i okna aktywnego ataku spoofingowego — obie klasy obecne w zbiorze.
 
 **Pułapki** (udokumentowane w `dataset_description.md`):
 
