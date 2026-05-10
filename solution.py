@@ -20,15 +20,58 @@ UWAGA: Notebooki .ipynb w tym repo zawieraja stary, wadliwy kod z data leakage
 
 import pandas as pd
 import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib
 import warnings
 warnings.filterwarnings('ignore')
 
 from sklearn.metrics import (f1_score, roc_auc_score, accuracy_score,
-                             precision_score, recall_score, confusion_matrix)
+                             precision_score, recall_score, confusion_matrix,
+                             ConfusionMatrixDisplay)
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import StratifiedKFold
 from xgboost import XGBClassifier
 from lightgbm import LGBMClassifier
+
+# ---- STYL WIZUALNY (konsekwentny na wszystkich wykresach) ----
+PLOT_STYLE = {
+    'bg_color': '#1a1a2e',
+    'text_color': '#e0e0e0',
+    'grid_color': '#333355',
+    'color_clean': '#4fc3f7',     # jasny niebieski = czysty lot
+    'color_spoof': '#ef5350',     # czerwony = spoofing
+    'color_kalman': '#66bb6a',    # zielony
+    'color_xgb': '#ffa726',       # pomaranczowy
+    'color_lgbm': '#ab47bc',      # fioletowy
+    'font_title': 14,
+    'font_label': 11,
+    'font_tick': 9,
+    'dpi': 130,
+}
+
+def setup_plot_style():
+    """Konfiguracja ciemnego motywu dla wszystkich wykresow."""
+    plt.rcParams.update({
+        'figure.facecolor': PLOT_STYLE['bg_color'],
+        'axes.facecolor': '#16213e',
+        'axes.edgecolor': PLOT_STYLE['grid_color'],
+        'axes.labelcolor': PLOT_STYLE['text_color'],
+        'axes.grid': True,
+        'grid.color': PLOT_STYLE['grid_color'],
+        'grid.alpha': 0.3,
+        'text.color': PLOT_STYLE['text_color'],
+        'xtick.color': PLOT_STYLE['text_color'],
+        'ytick.color': PLOT_STYLE['text_color'],
+        'figure.dpi': PLOT_STYLE['dpi'],
+        'font.size': PLOT_STYLE['font_tick'],
+        'axes.titlesize': PLOT_STYLE['font_title'],
+        'axes.labelsize': PLOT_STYLE['font_label'],
+        'legend.fontsize': PLOT_STYLE['font_tick'],
+        'savefig.bbox': 'tight',
+        'savefig.facecolor': PLOT_STYLE['bg_color'],
+    })
+
+setup_plot_style()
 
 
 # =============================================================================
@@ -187,12 +230,99 @@ SELECTED_FEATURES = {
 
 def get_feature_cols(df):
     """
-    Zwraca nazwy ściśle wyselekcjonowanych kolumn cech (whitelist) używanych do predykcji ML.
-    Model otrzymuje wyłącznie te cechy, które mają mocne fizyczne i analityczne uzasadnienie.
+    Zwraca nazwy scisle wyselekcjonowanych kolumn cech (whitelist) uzywanych do predykcji ML.
+    Model otrzymuje wylacznie te cechy, ktore maja mocne fizyczne i analityczne uzasadnienie.
     """
     selected = list(SELECTED_FEATURES.keys())
-    # Dodatkowe zabezpieczenie w wypadku braku którejś kolumny w df
     return [col for col in selected if col in df.columns]
+
+
+# =============================================================================
+# 4b. WIZUALIZACJA DYSTRYBUCJI CECH
+# =============================================================================
+
+def plot_feature_distributions(df, save_path='plots_distributions.png'):
+    """
+    Generuje histogramy dystrybucji wybranych cech, podzielone na label=0 (clean)
+    i label=1 (spoofing). Pozwala wizualnie ocenic separowalnosc klas.
+    """
+    features = get_feature_cols(df)
+    n = len(features)
+    ncols = 3
+    nrows = (n + ncols - 1) // ncols
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(16, nrows * 3.2))
+    fig.suptitle('Dystrybucja cech: czysty lot vs spoofing',
+                 fontsize=PLOT_STYLE['font_title'] + 2, fontweight='bold', y=1.01)
+
+    clean = df[df['label'] == 0]
+    spoof = df[df['label'] == 1]
+
+    for idx, feat in enumerate(features):
+        ax = axes.flat[idx]
+        ax.hist(clean[feat].dropna(), bins=60, alpha=0.6, density=True,
+                color=PLOT_STYLE['color_clean'], label='Czysty lot (0)')
+        ax.hist(spoof[feat].dropna(), bins=60, alpha=0.6, density=True,
+                color=PLOT_STYLE['color_spoof'], label='Spoofing (1)')
+        ax.set_title(feat, fontsize=PLOT_STYLE['font_label'], fontweight='bold')
+        ax.set_ylabel('Gestosc')
+        if idx == 0:
+            ax.legend(fontsize=PLOT_STYLE['font_tick'])
+
+    # Ukryj puste subploty
+    for idx in range(n, nrows * ncols):
+        axes.flat[idx].set_visible(False)
+
+    plt.tight_layout()
+    fig.savefig(save_path)
+    print(f"  [PLOT] Dystrybucje cech -> {save_path}")
+    plt.close(fig)
+
+
+# =============================================================================
+# 4c. MACIERZ POMYLEK (Confusion Matrix)
+# =============================================================================
+
+def plot_confusion_matrices(cm_dict, save_path='plots_confusion_matrices.png'):
+    """
+    Rysuje macierze pomylek dla wszystkich modeli side-by-side.
+    cm_dict: {'Model Name': {'block_0': cm, 'block_1': cm, 'block_2': cm, 'total': cm}}
+    """
+    models = list(cm_dict.keys())
+    n_models = len(models)
+
+    fig, axes = plt.subplots(1, n_models, figsize=(6 * n_models, 5))
+    fig.suptitle('Macierze pomylek (sumaryczne, Block CV)',
+                 fontsize=PLOT_STYLE['font_title'] + 2, fontweight='bold', y=1.03)
+
+    if n_models == 1:
+        axes = [axes]
+
+    model_colors = {
+        'Kalman chi²': plt.cm.Greens,
+        'XGBoost': plt.cm.Oranges,
+        'LightGBM': plt.cm.Purples,
+    }
+
+    for idx, (name, data) in enumerate(cm_dict.items()):
+        ax = axes[idx]
+        cm = data['total']
+        cmap = model_colors.get(name, plt.cm.Blues)
+
+        disp = ConfusionMatrixDisplay(confusion_matrix=cm,
+                                      display_labels=['Clean (0)', 'Spoof (1)'])
+        disp.plot(ax=ax, cmap=cmap, values_format='d', colorbar=False)
+        ax.set_title(f'{name}', fontsize=PLOT_STYLE['font_title'], fontweight='bold')
+        ax.set_xlabel('Predykcja', fontsize=PLOT_STYLE['font_label'])
+        ax.set_ylabel('Rzeczywistosc', fontsize=PLOT_STYLE['font_label'])
+        # Popraw kolor tekstu w komorkach
+        for text in disp.text_.ravel():
+            text.set_fontsize(PLOT_STYLE['font_title'])
+
+    plt.tight_layout()
+    fig.savefig(save_path)
+    print(f"  [PLOT] Macierze pomylek -> {save_path}")
+    plt.close(fig)
 
 # =============================================================================
 # 5. DETEKTOR KLASYCZNY — TEST INNOWACJI KALMANA (chi-squared)
@@ -242,6 +372,8 @@ def evaluate_kalman_block(df_raw, thresholds=None):
     default_threshold = chi2_dist.ppf(0.95, df=3)  # = 7.815
 
     rows = []
+    cm_dict = {}
+    total_cm = np.zeros((2, 2), dtype=int)
     n_folds = df['block_fold'].nunique()
 
     for fold_idx in range(n_folds):
@@ -288,11 +420,14 @@ def evaluate_kalman_block(df_raw, thresholds=None):
         })
 
         cm = confusion_matrix(yte, pred_calibrated)
+        cm_dict[f'block_{fold_idx}'] = cm
+        total_cm += cm
         print(f"\n  Block fold {fold_idx} (test: {int(mask_te.sum())} rows, "
               f"pos_rate={yte.mean():.2f}, thr_cal={best_thr:.2f}):")
         print(f"    F1 @7.81={f1_def:.3f}  F1 @cal={f1_cal:.3f}")
         print(f"    Confusion matrix: TN={cm[0,0]} FP={cm[0,1]} FN={cm[1,0]} TP={cm[1,1]}")
 
+    cm_dict['total'] = total_cm
     results = pd.DataFrame(rows)
     mean = results[['f1_default','f1_calibrated','precision','recall','roc_auc']].mean()
     print(f"\n{'='*60}")
@@ -304,7 +439,7 @@ def evaluate_kalman_block(df_raw, thresholds=None):
           f"F1@cal={mean['f1_calibrated']:.3f}  "
           f"P={mean['precision']:.3f}  R={mean['recall']:.3f}  "
           f"AUC={mean['roc_auc']:.3f}")
-    return results
+    return results, cm_dict
 
 
 # =============================================================================
@@ -379,6 +514,8 @@ def evaluate_block_cv(df, make_model, name="Model"):
     df = assign_block_folds(df)
     feature_cols = get_feature_cols(df)
     rows = []
+    cm_dict = {}  # confusion matrix per fold + total
+    total_cm = np.zeros((2, 2), dtype=int)
     n_folds = df['block_fold'].nunique()
 
     for fold_idx in range(n_folds):
@@ -416,11 +553,14 @@ def evaluate_block_cv(df, make_model, name="Model"):
             'accuracy': accuracy_score(yte, pred_calibrated),
         })
         cm = confusion_matrix(yte, pred_calibrated)
+        cm_dict[f'block_{fold_idx}'] = cm
+        total_cm += cm
         print(f"\n  Block fold {fold_idx} (test: {len(te)} rows, pos_rate={yte.mean():.2f}, "
               f"threshold={threshold:.3f}):")
         print(f"    F1 @0.5={f1_default:.3f}  F1 @cal={f1_calibrated:.3f}")
         print(f"    Confusion matrix: TN={cm[0,0]} FP={cm[0,1]} FN={cm[1,0]} TP={cm[1,1]}")
 
+    cm_dict['total'] = total_cm
     results = pd.DataFrame(rows)
     mean = results[['f1_default','f1_calibrated','precision','recall','roc_auc','accuracy']].mean()
     print(f"\n{'='*60}")
@@ -431,7 +571,7 @@ def evaluate_block_cv(df, make_model, name="Model"):
     print(f"  Srednia:  F1@0.5={mean['f1_default']:.3f}  "
           f"F1@cal={mean['f1_calibrated']:.3f}  "
           f"P={mean['precision']:.3f}  R={mean['recall']:.3f}  AUC={mean['roc_auc']:.3f}")
-    return results
+    return results, cm_dict
 
 
 # =============================================================================
@@ -491,24 +631,41 @@ if __name__ == '__main__':
     assert 'lat_x' not in df.columns, "lat_x nie powinien byc w danych!"
     assert 'label' not in feature_cols, "label nie powinien byc w cechach!"
 
-    # 3. Block CV — XGBoost
+    # 3. Analiza dystrybucji cech
+    print(f"\n{'#'*60}")
+    print(f"  ANALIZA DYSTRYBUCJI CECH")
+    print(f"{'#'*60}")
+    plot_feature_distributions(df)
+
+    # 4. Block CV — XGBoost
     print(f"\n{'#'*60}")
     print(f"  BLOCK-BASED 3-FOLD CV (podzial po segmentach)")
     print(f"  Realistyczny test: model testowany na sesji ktorej nie widzial.")
     print(f"{'#'*60}")
 
-    results_xgb = evaluate_block_cv(df, make_xgb, name="XGBoost")
+    results_xgb, cm_xgb = evaluate_block_cv(df, make_xgb, name="XGBoost")
 
-    # 4. Block CV — LightGBM
-    results_lgbm = evaluate_block_cv(df, make_lgbm, name="LightGBM")
+    # 5. Block CV — LightGBM
+    results_lgbm, cm_lgbm = evaluate_block_cv(df, make_lgbm, name="LightGBM")
 
-    # 5. Kalman chi-squared (klasyczny, bez ML)
+    # 6. Kalman chi-squared (klasyczny, bez ML)
     print(f"\n{'#'*60}")
     print(f"  KALMAN CHI-SQUARED (klasyczny detektor, bez treningu)")
     print(f"{'#'*60}")
-    results_kalman = evaluate_kalman_block(df_raw)
+    results_kalman, cm_kalman = evaluate_kalman_block(df_raw)
 
-    # 6. Porownanie modeli
+    # 7. Macierze pomylek
+    print(f"\n{'#'*60}")
+    print(f"  MACIERZE POMYLEK")
+    print(f"{'#'*60}")
+    cm_all = {
+        'Kalman chi\u00b2': cm_kalman,
+        'XGBoost': cm_xgb,
+        'LightGBM': cm_lgbm,
+    }
+    plot_confusion_matrices(cm_all)
+
+    # 8. Porownanie modeli
     print(f"\n{'='*60}")
     print(f"  POROWNANIE MODELI (Block CV — realistyczny)")
     print(f"{'='*60}")
