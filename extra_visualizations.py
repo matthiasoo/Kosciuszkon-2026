@@ -64,10 +64,10 @@ def plot_signal_drift(save_path='plot_1_signal_drift.png'):
     
     # Detekcja Kalmana (zaczyna alarmować tuż po rozpoczęciu dryfu, np. t=45)
     detection_time = 43
-    ax.axvspan(detection_time, 100, color=PLOT_STYLE['color_spoof'], alpha=0.15, label='Aura detekcji: Alarm Filtr Kalmana (χ²)')
+    ax.axvspan(detection_time + 6, 100, color=PLOT_STYLE['color_spoof'], alpha=0.15, label='Aura detekcji: Alarm Filtr Kalmana (χ²)')
     
     # Linia pionowa oznaczająca moment detekcji
-    ax.axvline(x=detection_time, color=PLOT_STYLE['color_kalman'], linestyle=':', linewidth=2)
+    ax.axvline(x=detection_time + 6, color=PLOT_STYLE['color_kalman'], linestyle=':', linewidth=2)
     ax.text(detection_time + 1.5, true_pos.max(), 'Wykrycie rozjazdu\nprzez Innowację Kalmana', 
             color=PLOT_STYLE['color_kalman'], fontsize=PLOT_STYLE['font_label'], fontweight='bold',
             verticalalignment='top')
